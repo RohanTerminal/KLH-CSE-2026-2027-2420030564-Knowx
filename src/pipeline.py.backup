@@ -1,0 +1,284 @@
+﻿import requests
+
+from src.hybrid_search import (
+    chunks,
+    semantic_search,
+    bm25_search,
+    reciprocal_rank_fusion
+)
+
+from src.reranker import rerank
+
+
+# ============================================================
+# KNOWX MULTI-TENANT RAG PIPELINE
+# Retrieval → RRF → Reranking → Context → LLM
+# ============================================================
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+LLM_MODEL = "llama3:8b"
+
+SEMANTIC_K = 10
+BM25_K = 10
+RRF_K = 20
+FINAL_K = 5
+
+
+def retrieve_and_rerank(query, company):
+    """
+    Retrieve relevant enterprise knowledge for a specific company.
+
+    Retrieval:
+        Semantic Search + BM25 + RRF + Cross-Encoder Reranking
+
+    Security:
+        Company filtering is applied during retrieval so that
+        documents belonging to other companies are never passed
+        to the reranker or LLM.
+    """
+
+    if not company:
+        raise ValueError("Company is required for tenant-isolated retrieval.")
+
+    company = company.strip().upper()
+
+    semantic_results = semantic_search(
+        query,
+        company
+    )[:SEMANTIC_K]
+
+    bm25_results = bm25_search(
+        query,
+        company
+    )[:BM25_K]
+
+    hybrid_results = reciprocal_rank_fusion(
+        semantic_results,
+        bm25_results
+    )
+
+    candidate_ids = [
+        index_id
+        for index_id, score in hybrid_results[:RRF_K]
+    ]
+
+    reranked = rerank(
+        query,
+        chunks,
+        candidate_ids,
+        top_k=FINAL_K
+    )
+
+    # Final safety check before context generation.
+    reranked = [
+        (index_id, score)
+        for index_id, score in reranked
+        if chunks[index_id].get("company", "").strip().upper() == company
+    ]
+
+    return reranked
+
+
+def build_context(query, reranked_results):
+    """
+    Build grounded context for the LLM.
+    """
+
+    context_parts = []
+
+    for rank, (index_id, score) in enumerate(
+        reranked_results,
+        start=1
+    ):
+        chunk = chunks[index_id]
+
+        source = (
+            f"[Source {rank}]\n"
+            f"Company: {chunk['company'].upper()}\n"
+            f"Document: {chunk['filename']}\n"
+            f"Chunk: {chunk['chunk_number']}\n"
+        )
+
+        context_parts.append(
+            source + "\n" + chunk["text"]
+        )
+
+    return "\n\n".join(context_parts)
+
+
+def generate_answer(query, context, company):
+    """
+    Generate a grounded answer using Llama 3 8B.
+    """
+
+    prompt = f"""
+You are KNOWX, an enterprise knowledge assistant.
+
+The authenticated user's company is:
+{company}
+
+Answer the user's question using ONLY the provided context.
+
+The context has already been filtered to the authenticated
+user's company. Do not use or assume information from any
+other company.
+
+If the context does not contain enough information,
+say that the information is not available in the
+provided enterprise documents.
+
+Do not invent facts.
+
+User question:
+{query}
+
+Retrieved context:
+{context}
+
+Provide a concise, factual answer.
+Mention the relevant source documents when appropriate.
+"""
+
+    payload = {
+        "model": LLM_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+
+    response = requests.post(
+        OLLAMA_URL,
+        json=payload,
+        timeout=120
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    return data.get("response", "").strip()
+
+
+def run_pipeline(query, company):
+    """
+    Complete multi-tenant KNOWX pipeline.
+
+    Flow:
+        User
+          ↓
+        Company/Tenant
+          ↓
+        Semantic Search
+          +
+        BM25
+          ↓
+        RRF
+          ↓
+        Reranking
+          ↓
+        Grounded Context
+          ↓
+        Llama 3 8B
+          ↓
+        Answer + Sources
+    """
+
+    if not company:
+        raise ValueError("Company is required.")
+
+    company = company.strip().upper()
+
+    reranked_results = retrieve_and_rerank(
+        query,
+        company
+    )
+
+    context = build_context(
+        query,
+        reranked_results
+    )
+
+    try:
+        answer = generate_answer(
+            query,
+            context,
+            company
+        )
+
+    except requests.exceptions.RequestException:
+        answer = None
+
+    sources = []
+
+    for rank, (index_id, score) in enumerate(
+        reranked_results,
+        start=1
+    ):
+        chunk = chunks[index_id]
+
+        # Final source-level tenant safety check.
+        if chunk.get("company", "").strip().upper() != company:
+            continue
+
+        sources.append({
+            "rank": rank,
+            "company": chunk["company"],
+            "document": chunk["filename"],
+            "chunk": chunk["chunk_number"],
+            "score": float(score)
+        })
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "context": context
+    }
+
+
+if __name__ == "__main__":
+
+    print("=" * 70)
+    print("KNOWX MULTI-TENANT HYBRID RAG PIPELINE")
+    print("=" * 70)
+
+    print(f"Knowledge chunks loaded: {len(chunks):,}")
+
+    company = input(
+        "\nEnter company "
+        "(MICROSOFT / INFOSYS / NVIDIA): "
+    ).strip().upper()
+
+    query = input("\nEnter your question: ")
+
+    print("\nRunning tenant-filtered RAG pipeline...")
+
+    try:
+        result = run_pipeline(
+            query,
+            company
+        )
+
+        print("\n" + "=" * 70)
+        print("FINAL ANSWER")
+        print("=" * 70)
+
+        print(result["answer"])
+
+        print("\n" + "=" * 70)
+        print("SOURCES")
+        print("=" * 70)
+
+        for source in result["sources"]:
+            print(
+                f"\nSOURCE {source['rank']}"
+                f"\nCompany: {source['company']}"
+                f"\nDocument: {source['document']}"
+                f"\nChunk: {source['chunk']}"
+                f"\nScore: {source['score']:.4f}"
+            )
+
+    except requests.exceptions.RequestException:
+        print("\nLlama is not connected yet.")
+        print("Tenant-filtered retrieval + reranking are ready.")
+
+    except Exception as e:
+        print(f"\nKNOWX ERROR: {e}")
